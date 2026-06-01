@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { HumanMessage } from "@langchain/core/messages";
+import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { agente } from "../agente";
 
 const router = Router();
@@ -24,6 +24,22 @@ router.post("/", async (req: Request<{}, {}, ChatBody>, res: Response) => {
       config
     );
     res.json({ respuesta: resultado.messages.at(-1)?.content ?? "Sin respuesta" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+router.get("/:session_id/historial", async (req: Request, res: Response) => {
+  const { session_id } = req.params;
+  try {
+    const config = { configurable: { thread_id: session_id } };
+    const state = await agente.getState(config);
+    const historial = (state.values.messages ?? []).map((m: BaseMessage) => ({
+      tipo: m instanceof HumanMessage ? "human" : m instanceof AIMessage ? "ai" : "tool",
+      contenido: m.content,
+    }));
+    res.json({ historial });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Error interno del servidor" });

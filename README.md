@@ -9,172 +9,346 @@ Construir un asistente de soporte al cliente que combine todo lo aprendido hoy:
 - **Memoria** para mantener el contexto de la conversación
 - **Tools** para acciones concretas (buscar pedido, calcular reembolso)
 - **LangGraph** para controlar el flujo con lógica condicional
-- **FastAPI** como interfaz HTTP
+- **Express** como interfaz HTTP
 
 ## Setup
 
 ```bash
 # fork & clone the repository
 cd lab-web-support-assistant-with-langchain
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install langchain langchain-openai langgraph chromadb python-dotenv
-pip install langchain-community langchain-text-splitters fastapi uvicorn
-pip freeze > requirements.txt
+npm install
+cp .env.example .env
+# Edita .env y añade tu OPENAI_API_KEY
 ```
 
 ## Paso 1 — Base de conocimiento (RAG)
 
-Crea un archivo `politicas.txt` con al menos 10 políticas de la empresa (devoluciones, envíos, garantía, etc.). Ingestalo en ChromaDB:
+Crea un archivo `politicas.txt` con al menos 10 políticas de la empresa (devoluciones, envíos, garantía, etc.). Ingestalo en el vector store:
 
-```python
-# ingestar.py
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
+```typescript
+// ingestar.ts
+import * as dotenv from "dotenv";
+dotenv.config();
 
-loader = TextLoader("politicas.txt", encoding="utf-8")
-docs = loader.load()
+import * as fs from "fs";
+import * as path from "path";
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
 
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-chunks = splitter.split_documents(docs)
+async function ingestar() {
+  const loader = new TextLoader(path.resolve("politicas.txt"));
+  const docs = await loader.load();
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-vectordb = Chroma.from_documents(chunks, embeddings, persist_directory="./chroma_db")
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 500,
+    chunkOverlap: 100,
+  });
+  const chunks = await splitter.splitDocuments(docs);
 
-print(f"Indexados {len(chunks)} chunks")
+  const embeddings = new OpenAIEmbeddings({ model: "text-embedding-3-small" });
+  const vectorStore = await MemoryVectorStore.fromDocuments(chunks, embeddings);
+
+  fs.writeFileSync(
+    path.resolve("vector_db.json"),
+    JSON.stringify(vectorStore.memoryVectors, null, 2)
+  );
+  console.log(`Indexados ${chunks.length} chunks en vector_db.json`);
+}
+
+ingestar().catch(console.error);
+```
+
+Ejecuta el script de ingestión:
+
+```bash
+npm run ingestar
 ```
 
 ## Paso 2 — Tools del asistente
 
-```python
-from langchain_core.tools import tool
+```typescript
+// src/tools.ts
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
 
-@tool
-def buscar_pedido(pedido_id: str) -> str:
-    """Busca el estado de un pedido por su ID. Ejemplo: buscar_pedido('PED-1234')"""
-    pedidos = {
-        "PED-1234": {"estado": "enviado", "fecha_entrega": "15/05/2026", "total": 89.99},
-        "PED-5678": {"estado": "en preparación", "fecha_entrega": "18/05/2026", "total": 45.50},
-    }
-    pedido = pedidos.get(pedido_id.upper())
-    return str(pedido) if pedido else f"Pedido {pedido_id} no encontrado"
+export const buscarPedido = tool(
+  async ({ pedidoId }) => {
+    const pedidos: Record<string, object> = {
+      "PED-1234": { estado: "enviado", fechaEntrega: "15/05/2026", total: 89.99 },
+      "PED-5678": { estado: "en preparación", fechaEntrega: "18/05/2026", total: 45.5 },
+    };
+    const pedido = pedidos[pedidoId.toUpperCase()];
+    return pedido ? JSON.stringify(pedido) : `Pedido ${pedidoId} no encontrado`;
+  },
+  {
+    name: "buscar_pedido",
+    description: "Busca el estado de un pedido por su ID. Ejemplo: buscar_pedido('PED-1234')",
+    schema: z.object({
+      pedidoId: z.string().describe("El ID del pedido, por ejemplo PED-1234"),
+    }),
+  }
+);
 
-@tool
-def calcular_reembolso(total: float, porcentaje: float) -> str:
-    """Calcula el importe de un reembolso parcial."""
-    reembolso = round(total * porcentaje / 100, 2)
-    return f"Reembolso del {porcentaje}% sobre {total}€: {reembolso}€"
+export const calcularReembolso = tool(
+  async ({ total, porcentaje }) => {
+    const reembolso = Math.round((total * porcentaje) / 100 * 100) / 100;
+    return `Reembolso del ${porcentaje}% sobre ${total}€: ${reembolso}€`;
+  },
+  {
+    name: "calcular_reembolso",
+    description: "Calcula el importe de un reembolso parcial dado el total y el porcentaje.",
+    schema: z.object({
+      total: z.number().describe("Importe total del pedido en euros"),
+      porcentaje: z.number().describe("Porcentaje de reembolso a aplicar"),
+    }),
+  }
+);
 ```
 
 ## Paso 3 — Agente LangGraph con RAG + Tools + Memoria
 
-```python
-# agente.py
-from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-import operator
+```typescript
+// src/agente.ts
+import * as dotenv from "dotenv";
+dotenv.config();
 
-# Estado del agente
-class EstadoSoporte(TypedDict):
-    mensajes: Annotated[Sequence[BaseMessage], operator.add]
+import * as fs from "fs";
+import * as path from "path";
+import { Annotation, END, StateGraph } from "@langchain/langgraph";
+import { MemorySaver } from "@langchain/langgraph";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { buscarPedido, calcularReembolso } from "./tools";
 
-# Retriever para RAG
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-vectordb = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+// Estado del agente
+const EstadoSoporte = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    reducer: (current, update) => current.concat(update),
+    default: () => [],
+  }),
+});
 
-tools = [buscar_pedido, calcular_reembolso]
-modelo = ChatOpenAI(model="gpt-4o", temperature=0)
-modelo_con_tools = modelo.bind_tools(tools)
+// RAG: carga el vector store serializado desde disco
+const embeddings = new OpenAIEmbeddings({ model: "text-embedding-3-small" });
 
-def nodo_llm(estado: EstadoSoporte) -> dict:
-    # Recupera contexto relevante del último mensaje del usuario
-    ultimo_humano = next(
-        (m.content for m in reversed(estado["mensajes"]) if isinstance(m, HumanMessage)),
-        ""
-    )
-    docs = retriever.invoke(ultimo_humano)
-    contexto = "\n".join(d.page_content for d in docs)
+function cargarVectorStore(): MemoryVectorStore {
+  const vectorStore = new MemoryVectorStore(embeddings);
+  const dbPath = path.resolve("vector_db.json");
+  if (fs.existsSync(dbPath)) {
+    vectorStore.memoryVectors = JSON.parse(fs.readFileSync(dbPath, "utf-8"));
+  } else {
+    console.warn("vector_db.json no encontrado. Ejecuta 'npm run ingestar' primero.");
+  }
+  return vectorStore;
+}
 
-    system = SystemMessage(content=f"""Eres un asistente de soporte amable y preciso.
+const vectorStore = cargarVectorStore();
+const retriever = vectorStore.asRetriever(3);
+
+const tools = [buscarPedido, calcularReembolso];
+const modelo = new ChatOpenAI({ model: "gpt-4o", temperature: 0 });
+const modeloConTools = modelo.bindTools(tools);
+
+async function nodoLlm(estado: typeof EstadoSoporte.State) {
+  const ultimoHumano = [...estado.messages]
+    .reverse()
+    .find((m) => m instanceof HumanMessage)?.content ?? "";
+
+  const docs = await retriever.invoke(ultimoHumano as string);
+  const contexto = docs.map((d) => d.pageContent).join("\n");
+
+  const system = new SystemMessage(`Eres un asistente de soporte amable y preciso.
 Usa las herramientas disponibles para consultar pedidos y calcular reembolsos.
 Responde preguntas sobre políticas usando este contexto:
 
-{contexto}
+${contexto}
 
-Si no tienes información, dilo claramente. No inventes datos.""")
+Si no tienes información, dilo claramente. No inventes datos.`);
 
-    mensajes_con_system = [system] + list(estado["mensajes"])
-    respuesta = modelo_con_tools.invoke(mensajes_con_system)
-    return {"mensajes": [respuesta]}
+  const respuesta = await modeloConTools.invoke([system, ...estado.messages]);
+  return { messages: [respuesta] };
+}
 
-def debe_continuar(estado: EstadoSoporte) -> str:
-    ultimo = estado["mensajes"][-1]
-    if hasattr(ultimo, "tool_calls") and ultimo.tool_calls:
-        return "usar_tool"
-    return END
+function debeContinuar(estado: typeof EstadoSoporte.State): string {
+  const ultimo = estado.messages.at(-1);
+  if (ultimo instanceof AIMessage && ultimo.tool_calls?.length) {
+    return "tools";
+  }
+  return END;
+}
 
-nodo_tools = ToolNode(tools)
+const nodoTools = new ToolNode(tools);
 
-grafo = StateGraph(EstadoSoporte)
-grafo.add_node("llm", nodo_llm)
-grafo.add_node("tools", nodo_tools)
-grafo.set_entry_point("llm")
-grafo.add_conditional_edges("llm", debe_continuar, {"usar_tool": "tools", END: END})
-grafo.add_edge("tools", "llm")
+const grafo = new StateGraph(EstadoSoporte)
+  .addNode("llm", nodoLlm)
+  .addNode("tools", nodoTools)
+  .addEdge("__start__", "llm")
+  .addConditionalEdges("llm", debeContinuar)
+  .addEdge("tools", "llm");
 
-checkpointer = MemorySaver()
-agente = grafo.compile(checkpointer=checkpointer)
+const checkpointer = new MemorySaver();
+export const agente = grafo.compile({ checkpointer });
 ```
 
-## Paso 4 — API FastAPI
+## Paso 4 — API Express
 
-```python
-# main.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
+```typescript
+// src/main.ts
+import * as dotenv from "dotenv";
+dotenv.config();
 
-app = FastAPI()
+import express, { Request, Response } from "express";
+import { HumanMessage } from "@langchain/core/messages";
+import { agente } from "./agente";
 
-class MensajeRequest(BaseModel):
-    session_id: str
-    mensaje: str
+const app = express();
+app.use(express.json());
 
-@app.post("/chat")
-def chat(request: MensajeRequest):
-    config = {"configurable": {"thread_id": request.session_id}}
-    resultado = agente.invoke(
-        {"mensajes": [HumanMessage(content=request.mensaje)]},
-        config=config
-    )
-    return {"respuesta": resultado["mensajes"][-1].content}
+interface ChatBody {
+  session_id: string;
+  mensaje: string;
+}
 
-@app.delete("/chat/{session_id}")
-def limpiar_sesion(session_id: str):
-    # El MemorySaver no expone borrado directo; en producción usar PostgresCheckpointer
-    return {"mensaje": f"Sesión {session_id} cerrada"}
+app.post("/chat", async (req: Request<{}, {}, ChatBody>, res: Response) => {
+  const { session_id, mensaje } = req.body;
+
+  if (!session_id || !mensaje) {
+    res.status(400).json({ error: "Se requieren session_id y mensaje" });
+    return;
+  }
+
+  const config = { configurable: { thread_id: session_id } };
+  const resultado = await agente.invoke(
+    { messages: [new HumanMessage(mensaje)] },
+    config
+  );
+  res.json({ respuesta: resultado.messages.at(-1)?.content });
+});
+
+app.delete("/chat/:session_id", (req: Request, res: Response) => {
+  const { session_id } = req.params;
+  // MemorySaver no expone borrado directo; en producción usar un checkpointer con BD
+  res.json({ mensaje: `Sesión ${session_id} cerrada` });
+});
+
+app.listen(process.env.PORT ?? 3000, () => {
+  console.log(`Servidor escuchando en http://localhost:${process.env.PORT ?? 3000}`);
+});
 ```
+
+## Ejecución
+
+```bash
+# Paso 1: indexar la base de conocimiento (genera vector_db.json)
+npm run ingestar
+
+# Paso 2: iniciar el servidor en modo desarrollo
+npm run dev
+```
+
+## Probar la API
+
+```bash
+# Preguntar sobre políticas (usa RAG)
+curl -X POST http://localhost:3000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "usuario-1", "mensaje": "¿Cuál es la política de devoluciones?"}'
+
+# Consultar un pedido (usa tool)
+curl -X POST http://localhost:3000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "usuario-1", "mensaje": "¿Cuál es el estado del pedido PED-1234?"}'
+
+# Calcular reembolso (usa tool)
+curl -X POST http://localhost:3000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "usuario-1", "mensaje": "Calcula el reembolso del 50% sobre 89.99€"}'
+
+# Cerrar sesión
+curl -X DELETE http://localhost:3000/chat/usuario-1
+```
+
+## Equivalencias Python → TypeScript
+
+| Python | TypeScript |
+|---|---|
+| `@tool` decorator | `tool()` de `@langchain/core/tools` + schema Zod |
+| `TypedDict` + `operator.add` | `Annotation.Root` + reducer |
+| `FastAPI` + `uvicorn` | `Express` + `tsx` |
+| `ChromaDB` (embebido) | `MemoryVectorStore` serializado a JSON |
+| `MemorySaver` | `MemorySaver` (mismo nombre) |
+| `ToolNode` | `ToolNode` (mismo nombre) |
+| `set_entry_point("llm")` | `.addEdge("__start__", "llm")` |
 
 ## Requisitos
 
-- [ ] La base de conocimiento tiene al menos 10 políticas indexadas en ChromaDB
+- [ ] La base de conocimiento tiene al menos 10 políticas indexadas
 - [ ] El agente usa RAG para responder preguntas sobre políticas
 - [ ] El agente usa las tools para buscar pedidos y calcular reembolsos
 - [ ] La memoria mantiene el contexto entre turnos de la misma sesión
 - [ ] El endpoint `POST /chat` funciona correctamente
 - [ ] Dos sesiones distintas no comparten historial
 
-## Bonus
+## Bonus 1 — Tool `escalarAHumano`
 
-- Añade una tool `escalar_a_humano(motivo: str)` que registre el caso en un archivo JSON
-- Implementa `PostgresCheckpointer` para memoria persistente real
-- Añade un endpoint `GET /chat/{session_id}/historial` que devuelva todos los mensajes
+Añade en `src/tools.ts` una tool que registre el caso en `casos.json` cuando el agente no pueda resolver el problema:
+
+```typescript
+export const escalarAHumano = tool(
+  async ({ motivo }) => {
+    const caso = { fecha: new Date().toISOString(), motivo };
+    const casos = fs.existsSync("casos.json")
+      ? JSON.parse(fs.readFileSync("casos.json", "utf-8"))
+      : [];
+    casos.push(caso);
+    fs.writeFileSync("casos.json", JSON.stringify(casos, null, 2));
+    return "Caso escalado correctamente. Un agente humano se pondrá en contacto contigo pronto.";
+  },
+  {
+    name: "escalar_a_humano",
+    description: "Escala el caso a un agente humano cuando no puedes resolver el problema del cliente.",
+    schema: z.object({
+      motivo: z.string().describe("Motivo por el que se escala el caso"),
+    }),
+  }
+);
+```
+
+Añádela al array `tools` en `agente.ts` e indica al agente en el system prompt que la use cuando no pueda resolver el problema.
+
+## Bonus 2 — Checkpointer persistente con SQLite
+
+Por defecto `MemorySaver` guarda la memoria en RAM — se pierde al reiniciar. Para persistirla en disco instala el paquete de checkpointer SQLite (requiere `@langchain/core >= 1.x`):
+
+```bash
+npm install @langchain/langgraph-checkpoint-sqlite
+```
+
+Y sustitúyelo en `agente.ts`:
+
+```typescript
+import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
+
+const checkpointer = SqliteSaver.fromConnString("checkpoints.db");
+```
+
+## Bonus 3 — Endpoint `GET /chat/:session_id/historial`
+
+Añade en `src/routes/chat.ts` un endpoint que devuelva todos los mensajes de una sesión:
+
+```typescript
+router.get("/:session_id/historial", async (req, res) => {
+  const { session_id } = req.params;
+  const config = { configurable: { thread_id: session_id } };
+  const state = await agente.getState(config);
+  const historial = (state.values.messages ?? []).map((m: BaseMessage) => ({
+    tipo: m instanceof HumanMessage ? "human" : m instanceof AIMessage ? "ai" : "tool",
+    contenido: m.content,
+  }));
+  res.json({ historial });
+});
+```

@@ -9,7 +9,7 @@ import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
 import { MemoryVectorStore } from "langchain/vectorstores/memory";
-import { buscarPedido, calcularReembolso } from "./tools";
+import { buscarPedido, calcularReembolso, escalarAHumano } from "./tools";
 
 const EstadoSoporte = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -40,7 +40,7 @@ function cargarVectorStore(): MemoryVectorStore {
 const vectorStore = cargarVectorStore();
 const retriever = vectorStore.asRetriever(3);
 
-const tools = [buscarPedido, calcularReembolso];
+const tools = [buscarPedido, calcularReembolso, escalarAHumano];
 const modelo = new ChatOpenAI({
   model: process.env.OLLAMA_CHAT_MODEL,
   temperature: 0,
@@ -61,6 +61,7 @@ async function nodoLlm(estado: typeof EstadoSoporte.State) {
 
   const system = new SystemMessage(`Eres un asistente de soporte amable y preciso.
 Usa las herramientas disponibles para consultar pedidos y calcular reembolsos.
+Si no puedes resolver el problema del cliente, usa escalar_a_humano.
 Responde preguntas sobre políticas usando este contexto:
 
 ${contexto}

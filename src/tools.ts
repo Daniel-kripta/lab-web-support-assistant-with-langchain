@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 
@@ -30,6 +31,25 @@ export const calcularReembolso = tool(
     schema: z.object({
       total: z.number().describe("Importe total del pedido en euros"),
       porcentaje: z.number().describe("Porcentaje de reembolso a aplicar"),
+    }),
+  }
+);
+
+export const escalarAHumano = tool(
+  async ({ motivo }) => {
+    const caso = { fecha: new Date().toISOString(), motivo };
+    const casos = fs.existsSync("casos.json")
+      ? JSON.parse(fs.readFileSync("casos.json", "utf-8"))
+      : [];
+    casos.push(caso);
+    fs.writeFileSync("casos.json", JSON.stringify(casos, null, 2));
+    return "Caso escalado correctamente. Un agente humano se pondrá en contacto contigo pronto.";
+  },
+  {
+    name: "escalar_a_humano",
+    description: "Escala el caso a un agente humano cuando no puedes resolver el problema del cliente.",
+    schema: z.object({
+      motivo: z.string().describe("Motivo por el que se escala el caso"),
     }),
   }
 );
